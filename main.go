@@ -5,7 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -20,14 +20,17 @@ import (
 // https://gist.github.com/jaredhoward/f231391529efcd638bb7
 
 const (
-	owner = "<repo_owner>"
-	repo  = "<repo_name>"
-	// where to copy files/directories
-	basePath    = "/tmp/"
-	accessToken = "<access_token(PAT)>"
+	owner    = "<repo_owner>"
+	repo     = "<repo_name>"
+	basePath = "/tmp/" // where to download files
 )
 
 func main() {
+	accessToken := os.Getenv("GITHUB_PAT")
+	if accessToken == "" {
+		log.Fatal("GITHUB_PAT is not set")
+	}
+
 	ctx := context.Background()
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: accessToken},
@@ -37,23 +40,29 @@ func main() {
 	getContents(ctx, client, "")
 }
 
-func check(err error) {
+func check(err error) error {
 	if err != nil {
 		log.Println(err)
+		return err
 	}
+	return nil
 }
 
 func createDirectory(path string) {
 	destination := filepath.Join(basePath, path)
 	err := os.Mkdir(destination, 0755)
-	check(err)
+	if check(err) != nil {
+		return
+	}
 	fmt.Println("destination path created:", destination)
 }
 
 func getContents(ctx context.Context, client *github.Client, path string) {
 
 	_, directoryContent, _, err := client.Repositories.GetContents(ctx, owner, repo, path, nil)
-	check(err)
+	if check(err) != nil {
+		return
+	}
 
 	for _, c := range directoryContent {
 		fmt.Println("file/dir details:", *c.Type, *c.Path, *c.Size, *c.SHA)
@@ -86,27 +95,37 @@ func downloadContents(ctx context.Context, client *github.Client, content *githu
 		fmt.Println("content:", *content.Content)
 	}
 
-	rc, _, err := client.Repositories.DownloadContents(ctx, owner, repo, *content.Path, nil)
-	check(err)
+	rc, err := client.Repositories.DownloadContents(ctx, owner, repo, *content.Path, nil)
+	if check(err) != nil {
+		return
+	}
 	defer rc.Close()
 
-	b, err := ioutil.ReadAll(rc)
-	check(err)
+	b, err := io.ReadAll(rc)
+	if check(err) != nil {
+		return
+	}
 
 	fmt.Println("Writing the file:", localPath)
 	f, err := os.Create(localPath)
-	check(err)
+	if check(err) != nil {
+		return
+	}
 	defer f.Close()
 	n, err := f.Write(b)
-	check(err)
+	if check(err) != nil {
+		return
+	}
 	if n != *content.Size {
 		fmt.Printf("number of bytes differ, %d vs %d\n", n, *content.Size)
 	}
 }
 
 func calculateGitSHA1(filePath string) string {
-	b, err := ioutil.ReadFile(filePath)
-	check(err)
+	b, err := os.ReadFile(filePath)
+	if check(err) != nil {
+		return ""
+	}
 	contentLen := len(b)
 	blobSlice := []byte("blob " + strconv.Itoa(contentLen))
 	blobSlice = append(blobSlice, '\x00')
