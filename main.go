@@ -22,7 +22,7 @@ import (
 const (
 	owner    = "<repo_owner>"
 	repo     = "<repo_name>"
-	basePath = "/tmp/" // where to download files
+	basePath = "/tmp" // where to download files
 )
 
 func main() {
