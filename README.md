@@ -1,4 +1,4 @@
-## GitHub C2 (command-and-control)
+## github c2 - pull
 
 ![](https://img.shields.io/github/stars/michalswi/github-c2)
 ![](https://img.shields.io/github/forks/michalswi/github-c2)
@@ -6,12 +6,13 @@
 ![](https://img.shields.io/github/issues/michalswi/github-c2)
 
 Use GitHub as a way to store configuration information.  
-Code is **pulling** all file(s) from a GitHub repository to the local file system.
+Code is **pulling** file(s) from a GitHub repository to the local file system.
 
 Populate script with:
 ```
-owner       = "<repo_owner>"
-repo        = "<repo_name>"
+owner    = "<repo_owner>"
+repo     = "<repo_name>"
+basePath = "/tmp"
 ```
 
 Instead of **Classic Tokens** you can use **Fine-grained personal access tokens**. Create a repo (public/private) and generate token (PAT) only for this repo. Set `GITHUB_PAT` env variable.
