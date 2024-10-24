@@ -11,19 +11,20 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/google/go-github/github"
+	"github.com/google/go-github/v66/github"
 	"golang.org/x/oauth2"
 )
 
-// base on:
-// https://pkg.go.dev/github.com/google/go-github/v50/github#section-documentation
-// https://gist.github.com/jaredhoward/f231391529efcd638bb7
+// based on:
+// https://github.com/google/go-github
+// https://pkg.go.dev/github.com/google/go-github/v66/github
 
-const (
-	owner    = "<repo_owner>"
-	repo     = "<repo_name>"
-	basePath = "/tmp" // where to download files
-)
+// todo - move to env vars
+// const (
+// 	owner    = "<repo_owner>"
+// 	repo     = "<repo_name>"
+// 	basePath = "/tmp" // where to download files
+// )
 
 func main() {
 	accessToken := os.Getenv("GITHUB_PAT")
@@ -37,15 +38,19 @@ func main() {
 	)
 	tc := oauth2.NewClient(ctx, ts)
 	client := github.NewClient(tc)
-	getContents(ctx, client, "")
+
+	err := getContents(ctx, client, "")
+	if err != nil {
+		log.Fatalf("Error fetching repository contents: %v", err)
+	}
 }
 
-func check(err error) error {
+func check(err error) bool {
 	if err != nil {
-		log.Println(err)
-		return err
+		log.Println("Error:", err)
+		return true
 	}
-	return nil
+	return false
 }
 
 func createDirectory(path string) {
@@ -57,11 +62,11 @@ func createDirectory(path string) {
 	fmt.Println("destination path created:", destination)
 }
 
-func getContents(ctx context.Context, client *github.Client, path string) {
+func getContents(ctx context.Context, client *github.Client, path string) error {
 
 	_, directoryContent, _, err := client.Repositories.GetContents(ctx, owner, repo, path, nil)
-	if check(err) != nil {
-		return
+	if check(err) {
+		return err
 	}
 
 	for _, c := range directoryContent {
@@ -95,7 +100,7 @@ func downloadContents(ctx context.Context, client *github.Client, content *githu
 		fmt.Println("content:", *content.Content)
 	}
 
-	rc, err := client.Repositories.DownloadContents(ctx, owner, repo, *content.Path, nil)
+	rc, _, err := client.Repositories.DownloadContents(ctx, owner, repo, *content.Path, nil)
 	if check(err) != nil {
 		return
 	}
