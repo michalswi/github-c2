@@ -8,21 +8,14 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"syscall"
+	"time"
 
-	"github.com/google/go-github/github"
+	"github.com/google/go-github/v66/github"
 	"golang.org/x/oauth2"
-)
-
-// base on:
-// https://pkg.go.dev/github.com/google/go-github/v50/github#section-documentation
-// https://gist.github.com/jaredhoward/f231391529efcd638bb7
-
-const (
-	owner    = "<repo_owner>"
-	repo     = "<repo_name>"
-	basePath = "/tmp" // where to download files
 )
 
 func main() {
@@ -31,107 +24,156 @@ func main() {
 		log.Fatal("GITHUB_PAT is not set")
 	}
 
-	ctx := context.Background()
+	owner := os.Getenv("REPO_OWNER")
+	if accessToken == "" {
+		log.Fatal("REPO_OWNER is not set")
+	}
+
+	repo := os.Getenv("REPO_NAME")
+	if accessToken == "" {
+		log.Fatal("REPO_NAME is not set")
+	}
+
+	basePath := os.Getenv("BASE_PATH")
+	if accessToken == "" {
+		log.Fatal("BASE_PATH is not set")
+	}
+
+	// graceful shutdown
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	defer cancel()
+
+	go func() {
+		<-signalChan
+		fmt.Println("Interrupt signal received, cleaning up...")
+		cancel()
+		os.Exit(0)
+	}()
+
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: accessToken},
 	)
+
 	tc := oauth2.NewClient(ctx, ts)
 	client := github.NewClient(tc)
-	getContents(ctx, client, "")
+
+	err := getContents(ctx, client, "", owner, repo, basePath)
+	if err != nil {
+		log.Fatalf("Error fetching repository contents: %v", err)
+	}
 }
 
-func check(err error) error {
+func check(err error) bool {
 	if err != nil {
-		log.Println(err)
+		log.Println("Error:", err)
+		return true
+	}
+	return false
+}
+
+func createDirectory(path string, basePath string) error {
+	if path == "" {
+		return fmt.Errorf("invalid directory path")
+	}
+
+	destination := filepath.Join(basePath, path)
+
+	err := os.Mkdir(destination, 0755)
+	if err != nil && !os.IsExist(err) {
+		return fmt.Errorf("error creating directory %s: %w", destination, err)
+	}
+
+	log.Printf("Created directory: %s", destination)
+	return nil
+}
+
+func getContents(ctx context.Context, client *github.Client, path string, owner string, repo string, basePath string) error {
+	_, directoryContent, _, err := client.Repositories.GetContents(ctx, owner, repo, path, nil)
+	if check(err) {
 		return err
+	}
+
+	for _, c := range directoryContent {
+		log.Println("Processing:", *c.Type, *c.Path, *c.Size, *c.SHA)
+
+		local := filepath.Join(basePath, *c.Path)
+		log.Println("Local path:", local)
+
+		switch *c.Type {
+		case "file":
+			err := handleFile(ctx, client, c, local, owner, repo, basePath)
+			if err != nil {
+				log.Printf("Error handling file: %v", err)
+			}
+		case "dir":
+			err := createDirectory(*c.Path, basePath)
+			if err != nil {
+				log.Printf("Error creating directory: %v", err)
+			}
+			getContents(ctx, client, *c.Path, owner, repo, basePath)
+		}
 	}
 	return nil
 }
 
-func createDirectory(path string) {
-	destination := filepath.Join(basePath, path)
-	err := os.Mkdir(destination, 0755)
-	if check(err) != nil {
-		return
-	}
-	fmt.Println("destination path created:", destination)
-}
-
-func getContents(ctx context.Context, client *github.Client, path string) {
-
-	_, directoryContent, _, err := client.Repositories.GetContents(ctx, owner, repo, path, nil)
-	if check(err) != nil {
-		return
-	}
-
-	for _, c := range directoryContent {
-		fmt.Println("file/dir details:", *c.Type, *c.Path, *c.Size, *c.SHA)
-
-		local := filepath.Join(basePath, *c.Path)
-		fmt.Println("file/dir path:", local)
-
-		switch *c.Type {
-		case "file":
-			_, err := os.Stat(local)
-			if err == nil {
-				sha := calculateGitSHA1(local)
-				// fmt.Println(*c.SHA)
-				// fmt.Println(sha)
-				if *c.SHA == sha {
-					fmt.Println("No need to update this file, the SHA1 is the same")
-					continue
-				}
-			}
-			downloadContents(ctx, client, c, local)
-		case "dir":
-			createDirectory(*c.Path)
-			getContents(ctx, client, *c.Path)
+func handleFile(ctx context.Context, client *github.Client, content *github.RepositoryContent, localPath string, owner string, repo string, basePath string) error {
+	// Check if file exists and compare SHA1
+	_, err := os.Stat(localPath)
+	if err == nil {
+		sha := calculateGitSHA1(localPath)
+		if *content.SHA == sha {
+			log.Printf("No need to update file %s, SHA1 is the same", localPath)
+			return nil
 		}
 	}
+	return downloadContents(ctx, client, content, localPath, owner, repo)
 }
 
-func downloadContents(ctx context.Context, client *github.Client, content *github.RepositoryContent, localPath string) {
-	if content.Content != nil {
-		fmt.Println("content:", *content.Content)
-	}
-
-	rc, err := client.Repositories.DownloadContents(ctx, owner, repo, *content.Path, nil)
-	if check(err) != nil {
-		return
+func downloadContents(ctx context.Context, client *github.Client, content *github.RepositoryContent, localPath string, owner string, repo string) error {
+	rc, _, err := client.Repositories.DownloadContents(ctx, owner, repo, *content.Path, nil)
+	if check(err) {
+		return err
 	}
 	defer rc.Close()
 
 	b, err := io.ReadAll(rc)
-	if check(err) != nil {
-		return
+	if check(err) {
+		return err
 	}
 
-	fmt.Println("Writing the file:", localPath)
+	log.Printf("Writing file: %s", localPath)
 	f, err := os.Create(localPath)
-	if check(err) != nil {
-		return
+	if check(err) {
+		return err
 	}
 	defer f.Close()
+
 	n, err := f.Write(b)
-	if check(err) != nil {
-		return
+	if check(err) {
+		return err
 	}
 	if n != *content.Size {
-		fmt.Printf("number of bytes differ, %d vs %d\n", n, *content.Size)
+		log.Printf("Warning: written bytes %d do not match expected size %d", n, *content.Size)
 	}
+
+	return nil
 }
 
 func calculateGitSHA1(filePath string) string {
 	b, err := os.ReadFile(filePath)
-	if check(err) != nil {
+	if check(err) {
 		return ""
 	}
+
 	contentLen := len(b)
 	blobSlice := []byte("blob " + strconv.Itoa(contentLen))
 	blobSlice = append(blobSlice, '\x00')
 	blobSlice = append(blobSlice, b...)
+
 	h := sha1.New()
 	h.Write(blobSlice)
-	bs := h.Sum(nil)
-	return hex.EncodeToString(bs)
+	return hex.EncodeToString(h.Sum(nil))
 }
