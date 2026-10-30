@@ -1,4 +1,6 @@
-## github c2 - pull
+<div align="center">
+
+# github c2 - pull
 
 ![](https://img.shields.io/github/stars/michalswi/github-c2)
 ![](https://img.shields.io/github/forks/michalswi/github-c2)
@@ -6,7 +8,9 @@
 ![](https://img.shields.io/github/issues/michalswi/github-c2)
 
 Use GitHub as a way to store configuration information.  
-Code is **pulling** file(s) from a GitHub repository to the local file system.
+Code is **pulling** file(s) from a GitHub repository to the local file system
+
+</div>
 
 Instead of **Classic Tokens** you can use **Fine-grained personal access tokens**. Create a repo (public/private) and generate token (PAT) **only** for this repo. Set `GITHUB_PAT` env variable.
 
@@ -22,9 +26,14 @@ export REPO_OWNER=<>
 export REPO_NAME=<>
 export BASE_PATH=<>
 ```
+Optionally set a branch (tag or commit SHA also works); if unset, the repository's default branch is used:
+```
+export REPO_BRANCH=<>
+```
 Example:
 ```
 export REPO_OWNER="michalswi"
 export REPO_NAME="github-c2"
 export BASE_PATH="/tmp"
+export REPO_BRANCH="dev"
 ```

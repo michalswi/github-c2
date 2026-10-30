@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,66 +13,61 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
-	"time"
 
 	"github.com/google/go-github/v66/github"
 	"golang.org/x/oauth2"
 )
 
+// Version is set at build time via -ldflags.
+var Version = "dev"
+
+const (
+	dirMode  = 0o700
+	fileMode = 0o600
+)
+
+func requireEnv(name string) string {
+	v := os.Getenv(name)
+	if v == "" {
+		log.Fatalf("%s is not set", name)
+	}
+	return v
+}
+
 func main() {
-	accessToken := os.Getenv("GITHUB_PAT")
-	if accessToken == "" {
-		log.Fatal("GITHUB_PAT is not set")
+	accessToken := requireEnv("GITHUB_PAT")
+	owner := requireEnv("REPO_OWNER")
+	repo := requireEnv("REPO_NAME")
+	basePath := requireEnv("BASE_PATH")
+
+	// optional; empty means the repository's default branch
+	var opts *github.RepositoryContentGetOptions
+	if branch := os.Getenv("REPO_BRANCH"); branch != "" {
+		opts = &github.RepositoryContentGetOptions{Ref: branch}
 	}
 
-	owner := os.Getenv("REPO_OWNER")
-	if accessToken == "" {
-		log.Fatal("REPO_OWNER is not set")
-	}
+	log.Printf("gh-c2 version %s", Version)
 
-	repo := os.Getenv("REPO_NAME")
-	if accessToken == "" {
-		log.Fatal("REPO_NAME is not set")
-	}
+	// cancelled on SIGINT/SIGTERM so deferred cleanup still runs
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	basePath := os.Getenv("BASE_PATH")
-	if accessToken == "" {
-		log.Fatal("BASE_PATH is not set")
-	}
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: accessToken})
+	client := github.NewClient(oauth2.NewClient(ctx, ts))
 
-	// graceful shutdown
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-	defer cancel()
-
-	go func() {
-		<-signalChan
-		fmt.Println("Interrupt signal received, cleaning up...")
-		cancel()
-		os.Exit(0)
-	}()
-
-	ts := oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: accessToken},
-	)
-
-	tc := oauth2.NewClient(ctx, ts)
-	client := github.NewClient(tc)
-
-	err := getContents(ctx, client, "", owner, repo, basePath)
-	if err != nil {
+	if err := getContents(ctx, client, "", owner, repo, basePath, opts); err != nil {
+		stop()
 		log.Fatalf("Error fetching repository contents: %v", err)
 	}
 }
 
-func check(err error) bool {
-	if err != nil {
-		log.Println("Error:", err)
-		return true
+// localTarget maps a remote repository path to a path under basePath,
+// rejecting anything that would escape it.
+func localTarget(basePath, remotePath string) (string, error) {
+	if !filepath.IsLocal(filepath.FromSlash(remotePath)) {
+		return "", fmt.Errorf("unsafe remote path %q", remotePath)
 	}
-	return false
+	return filepath.Join(basePath, filepath.FromSlash(remotePath)), nil
 }
 
 func createDirectory(path string, basePath string) error {
@@ -79,10 +75,12 @@ func createDirectory(path string, basePath string) error {
 		return fmt.Errorf("invalid directory path")
 	}
 
-	destination := filepath.Join(basePath, path)
+	destination, err := localTarget(basePath, path)
+	if err != nil {
+		return err
+	}
 
-	err := os.Mkdir(destination, 0755)
-	if err != nil && !os.IsExist(err) {
+	if err := os.MkdirAll(destination, dirMode); err != nil {
 		return fmt.Errorf("error creating directory %s: %w", destination, err)
 	}
 
@@ -90,90 +88,107 @@ func createDirectory(path string, basePath string) error {
 	return nil
 }
 
-func getContents(ctx context.Context, client *github.Client, path string, owner string, repo string, basePath string) error {
-	_, directoryContent, _, err := client.Repositories.GetContents(ctx, owner, repo, path, nil)
-	if check(err) {
-		return err
+func getContents(ctx context.Context, client *github.Client, path string, owner string, repo string, basePath string, opts *github.RepositoryContentGetOptions) error {
+	_, directoryContent, _, err := client.Repositories.GetContents(ctx, owner, repo, path, opts)
+	if err != nil {
+		return fmt.Errorf("error getting contents of %q: %w", path, err)
 	}
 
+	var errs []error
 	for _, c := range directoryContent {
-		log.Println("Processing:", *c.Type, *c.Path, *c.Size, *c.SHA)
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
 
-		local := filepath.Join(basePath, *c.Path)
-		log.Println("Local path:", local)
+		log.Println("Processing:", c.GetType(), c.GetPath(), c.GetSize(), c.GetSHA())
 
-		switch *c.Type {
+		switch c.GetType() {
 		case "file":
-			err := handleFile(ctx, client, c, local, owner, repo, basePath)
+			local, err := localTarget(basePath, c.GetPath())
 			if err != nil {
-				log.Printf("Error handling file: %v", err)
+				errs = append(errs, err)
+				continue
+			}
+			log.Println("Local path:", local)
+			if err := handleFile(ctx, client, c, local, owner, repo, opts); err != nil {
+				errs = append(errs, fmt.Errorf("file %s: %w", c.GetPath(), err))
 			}
 		case "dir":
-			err := createDirectory(*c.Path, basePath)
-			if err != nil {
-				log.Printf("Error creating directory: %v", err)
+			if err := createDirectory(c.GetPath(), basePath); err != nil {
+				errs = append(errs, err)
+				continue
 			}
-			getContents(ctx, client, *c.Path, owner, repo, basePath)
+			if err := getContents(ctx, client, c.GetPath(), owner, repo, basePath, opts); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
-func handleFile(ctx context.Context, client *github.Client, content *github.RepositoryContent, localPath string, owner string, repo string, basePath string) error {
-	// Check if file exists and compare SHA1
-	_, err := os.Stat(localPath)
-	if err == nil {
-		sha := calculateGitSHA1(localPath)
-		if *content.SHA == sha {
+func handleFile(ctx context.Context, client *github.Client, content *github.RepositoryContent, localPath string, owner string, repo string, opts *github.RepositoryContentGetOptions) error {
+	// Skip the download when the local git blob SHA matches the remote one
+	if _, err := os.Stat(localPath); err == nil {
+		sha, err := calculateGitSHA1(localPath)
+		if err != nil {
+			log.Printf("Cannot hash %s, re-downloading: %v", localPath, err)
+		} else if content.GetSHA() == sha {
 			log.Printf("No need to update file %s, SHA1 is the same", localPath)
 			return nil
 		}
 	}
-	return downloadContents(ctx, client, content, localPath, owner, repo)
+	return downloadContents(ctx, client, content, localPath, owner, repo, opts)
 }
 
-func downloadContents(ctx context.Context, client *github.Client, content *github.RepositoryContent, localPath string, owner string, repo string) error {
-	rc, _, err := client.Repositories.DownloadContents(ctx, owner, repo, *content.Path, nil)
-	if check(err) {
+func downloadContents(ctx context.Context, client *github.Client, content *github.RepositoryContent, localPath string, owner string, repo string, opts *github.RepositoryContentGetOptions) (err error) {
+	rc, _, err := client.Repositories.DownloadContents(ctx, owner, repo, content.GetPath(), opts)
+	if err != nil {
 		return err
 	}
 	defer rc.Close()
 
-	b, err := io.ReadAll(rc)
-	if check(err) {
+	if err := os.MkdirAll(filepath.Dir(localPath), dirMode); err != nil {
 		return err
 	}
 
 	log.Printf("Writing file: %s", localPath)
-	f, err := os.Create(localPath)
-	if check(err) {
+	f, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fileMode)
+	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}()
 
-	n, err := f.Write(b)
-	if check(err) {
+	n, err := io.Copy(f, rc)
+	if err != nil {
 		return err
 	}
-	if n != *content.Size {
-		log.Printf("Warning: written bytes %d do not match expected size %d", n, *content.Size)
+	if n != int64(content.GetSize()) {
+		log.Printf("Warning: written bytes %d do not match expected size %d", n, content.GetSize())
 	}
 
 	return nil
 }
 
-func calculateGitSHA1(filePath string) string {
-	b, err := os.ReadFile(filePath)
-	if check(err) {
-		return ""
+func calculateGitSHA1(filePath string) (string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
 	}
 
-	contentLen := len(b)
-	blobSlice := []byte("blob " + strconv.Itoa(contentLen))
-	blobSlice = append(blobSlice, '\x00')
-	blobSlice = append(blobSlice, b...)
-
 	h := sha1.New()
-	h.Write(blobSlice)
-	return hex.EncodeToString(h.Sum(nil))
+	h.Write([]byte("blob " + strconv.FormatInt(info.Size(), 10) + "\x00"))
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
